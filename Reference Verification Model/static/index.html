@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference Verifier</title>
+<style>
+  :root {
+    --bg:#f7f8fa; --panel:#ffffff; --line:#e3e6eb; --line2:#eef0f3;
+    --text:#1c2430; --muted:#697282; --accent:#2f6df0; --accent-weak:#eaf1ff;
+    --green:#1a7f37; --green-bg:#eaf6ed; --green-line:#bfe3c8;
+    --amber:#9a6700; --amber-bg:#fdf6e3; --amber-line:#ecdca0;
+    --red:#c4332b; --red-bg:#fbecea; --red-line:#f0c5c0;
+    --grey:#5b6472; --grey-bg:#f0f2f5;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  header { padding:28px 32px 4px; }
+  h1 { margin:0; font-size:21px; font-weight:650; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; margin-top:5px; max-width:680px; }
+  main { max-width:1200px; margin:0 auto; padding:16px 24px 80px; }
+
+  /* ---- Upload ---- */
+  #drop {
+    border:1.5px dashed var(--line); border-radius:12px; padding:30px 22px;
+    text-align:center; color:var(--muted); cursor:pointer; transition:.15s;
+    background:var(--panel);
+  }
+  #drop.drag { border-color:var(--accent); background:var(--accent-weak); color:var(--text); }
+  #drop strong { color:var(--text); font-weight:600; }
+  #drop .hint { font-size:12.5px; margin-top:6px; }
+  #fileInput { display:none; }
+  .upload-row { display:flex; align-items:center; gap:14px; margin-top:14px; }
+  #fileName { font-size:13.5px; color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #fileName.empty { color:var(--muted); }
+  button.btn {
+    background:var(--accent); color:#fff; border:none; border-radius:8px;
+    padding:9px 22px; font-size:14px; font-weight:600; cursor:pointer; transition:.12s;
+  }
+  button.btn:hover:not(:disabled) { filter:brightness(1.05); }
+  button.btn:disabled { opacity:.45; cursor:default; }
+
+  /* ---- Status bar ---- */
+  #status {
+    display:none; align-items:center; gap:10px; margin:18px 0 0;
+    padding:11px 15px; background:var(--panel); border:1px solid var(--line);
+    border-radius:9px; font-size:13.5px; color:var(--text);
+  }
+  #status.lost { background:var(--red-bg); border-color:var(--red-line); color:var(--red); }
+  #status.done { color:var(--muted); }
+  .spinner {
+    flex:none; width:14px; height:14px; border:2px solid var(--line);
+    border-top-color:var(--accent); border-radius:50%; animation:spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* ---- Error ---- */
+  #error {
+    display:none; margin:18px 0 0; padding:12px 16px; font-size:14px;
+    color:var(--red); background:var(--red-bg); border:1px solid var(--red-line); border-radius:9px;
+  }
+
+  /* ---- Summary ---- */
+  #summary {
+    display:none; margin:22px 0 12px; font-size:14px; color:var(--muted);
+    font-variant-numeric:tabular-nums;
+  }
+  #summary b { color:var(--text); font-weight:650; }
+  #summary .v { color:var(--green); } #summary .u { color:var(--amber); } #summary .x { color:var(--red); }
+
+  /* ---- Filter bar ---- */
+  #filters { display:none; gap:9px; flex-wrap:wrap; margin:14px 0 6px; }
+  .chip {
+    cursor:pointer; user-select:none; display:inline-flex; align-items:center; gap:7px;
+    padding:6px 13px; border-radius:999px; font-size:13px; font-weight:600;
+    border:1px solid var(--line); background:var(--panel); color:var(--muted); transition:.12s;
+  }
+  .chip:hover { border-color:var(--accent); }
+  .chip .badge-n {
+    font-size:11.5px; font-weight:700; padding:1px 7px; border-radius:999px;
+    background:var(--grey-bg); color:var(--muted); min-width:20px; text-align:center;
+  }
+  .chip:not(.on) { opacity:.5; }
+  .chip.f-Verified.on   { color:var(--green); background:var(--green-bg); border-color:var(--green-line); }
+  .chip.f-Verified.on  .badge-n { background:#d6efdd; color:var(--green); }
+  .chip.f-Uncertain.on  { color:var(--amber); background:var(--amber-bg); border-color:var(--amber-line); }
+  .chip.f-Uncertain.on .badge-n { background:#f4e9bf; color:var(--amber); }
+  .chip.f-Unverified.on { color:var(--red); background:var(--red-bg); border-color:var(--red-line); }
+  .chip.f-Unverified.on .badge-n { background:#f4d3ce; color:var(--red); }
+  .chip.f-Web.on        { color:var(--accent); background:var(--accent-weak); border-color:#bcd2fb; }
+  .chip.f-Web.on       .badge-n { background:#d7e4fd; color:var(--accent); }
+
+  /* ---- Reference list ---- */
+  #listWrap { display:none; }
+  #count { font-size:12.5px; color:var(--muted); margin:4px 2px 10px; }
+  .card {
+    background:var(--panel); border:1px solid var(--line); border-radius:11px;
+    padding:13px 16px; transition:.1s;
+  }
+  .card.pending { opacity:.78; }
+  .card-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .card-title { font-size:15px; font-weight:600; line-height:1.4; flex:1; min-width:60%; }
+  .card-title .year { color:var(--muted); font-weight:500; }
+  .card-id { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; flex:none; }
+
+  .badge {
+    flex:none; display:inline-flex; align-items:center; gap:5px;
+    padding:3px 10px; border-radius:999px; font-size:11.5px; font-weight:700;
+    border:1px solid transparent; white-space:nowrap;
+  }
+  .badge.Verified   { color:var(--green); background:var(--green-bg); border-color:var(--green-line); }
+  .badge.Uncertain  { color:var(--amber); background:var(--amber-bg); border-color:var(--amber-line); }
+  .badge.Unverified { color:var(--red);   background:var(--red-bg);   border-color:var(--red-line); }
+  .badge.Pending    { color:var(--grey);  background:var(--grey-bg);  border-color:var(--line); }
+
+  .authors { font-size:13px; color:var(--muted); margin-top:6px; }
+  .authors .lbl { color:var(--text); font-weight:500; }
+  .warn { display:flex; gap:6px; font-size:12.5px; color:var(--amber); margin-top:7px; line-height:1.45; }
+  .warn .ic { flex:none; }
+
+  /* Per-field verification checklist */
+  .checklist {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-top: 8px;
+    font-size: 13px;
+    align-items: baseline;
+  }
+  .chk-item { display: flex; align-items: baseline; gap: 5px; }
+  .chk-ok   { color: var(--green); font-weight: 600; }
+  .chk-warn { color: var(--amber); font-weight: 600; }
+  .chk-bad  { color: var(--red);   font-weight: 600; }
+  .chk-info { color: var(--muted); font-weight: 600; }
+  .chk-note { color: var(--muted); font-size: 12px; }
+  .card-foot { display:flex; align-items:center; gap:12px; margin-top:9px; flex-wrap:wrap; }
+
+  /* Side-by-side comparison: original reference vs matched KB/web record. */
+  .compare {
+    display:flex; gap:14px; margin-top:9px; flex-wrap:wrap;
+  }
+  .compare-col {
+    flex:1 1 240px; min-width:220px; padding:9px 12px;
+    border:1px solid var(--line2); border-radius:8px; background:#fbfbfc;
+  }
+  .compare-col.kb { background:#fafbff; }
+  .compare-label {
+    font-size:10.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--muted); margin-bottom:5px;
+  }
+  .compare-title { font-size:13.5px; font-weight:600; line-height:1.4; color:var(--text); }
+  .compare-meta { font-size:12.5px; color:var(--muted); margin-top:4px; line-height:1.4; }
+  .compare-meta .lbl { color:var(--text); font-weight:500; }
+  .compare-desc { font-size:12px; color:var(--muted); margin-top:6px; font-style:italic; line-height:1.4; }
+  .compare-empty { font-size:12.5px; color:var(--muted); font-style:italic; }
+
+  .source {
+    font-size:11px; font-weight:600; color:var(--grey); background:var(--grey-bg);
+    border:1px solid var(--line); padding:2px 9px; border-radius:999px; letter-spacing:.01em;
+  }
+  .openlink { font-size:12.5px; color:var(--accent); text-decoration:none; font-weight:600; }
+  .openlink:hover { text-decoration:underline; }
+  .verifying { display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); margin-top:8px; }
+  .verifying .spinner { width:12px; height:12px; }
+  .ref-reason { font-size:12.5px; color:var(--muted); margin:6px 0 0; font-style:italic; line-height:1.45; }
+
+  .empty-note { color:var(--muted); font-size:13px; text-align:center; padding:24px; }
+
+  /* ---- Side-by-side comparison (original vs matched KB/web candidate) ---- */
+  .compare { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:10px; }
+  .compare-col {
+    background:var(--bg); border:1px solid var(--line2); border-radius:8px;
+    padding:10px 12px; min-width:0;
+  }
+  .compare-label {
+    font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.04em;
+    color:var(--muted); margin-bottom:6px;
+  }
+  .compare-title { font-size:13.5px; font-weight:600; line-height:1.4; margin-bottom:4px; word-break:break-word; }
+  .compare-title .year { color:var(--muted); font-weight:500; }
+  .compare-field { font-size:12.5px; color:var(--muted); margin-top:3px; line-height:1.4; }
+  .compare-field b { color:var(--text); font-weight:600; }
+  .compare-missing { color:var(--amber); font-style:italic; }
+  .compare-empty { font-size:12.5px; color:var(--muted); font-style:italic; }
+  @media (max-width:640px) { .compare { grid-template-columns:1fr; } }
+
+  /* ---- Per-document groups (multi-PDF) ---- */
+  #docs { max-height:66vh; overflow-y:auto; padding:0 2px 2px; }
+  .doc { margin-bottom:24px; }
+  .doc:last-child { margin-bottom:0; }
+  /* Title row sticks to the top of the scroll area so collapse is always one
+     click away while scrolling through a thesis. Opaque bg + z-index so the
+     reference cards scroll underneath it. */
+  .doc-head { display:flex; align-items:baseline; gap:10px; margin:0 0 6px; padding:8px 2px 6px;
+              border-bottom:1px solid var(--line); cursor:pointer; user-select:none;
+              position:sticky; top:0; z-index:2; background:var(--bg); }
+  .doc-head:hover .doc-name { color:var(--accent); }
+  .doc-toggle { flex:none; font-size:11px; color:var(--muted); transition:transform .15s; align-self:center; }
+  .doc.collapsed .doc-toggle { transform:rotate(-90deg); }
+  .doc.collapsed .doc-body { display:none; }
+  .doc-name { font-size:14.5px; font-weight:650; color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .doc-num { font-size:11.5px; color:var(--muted); flex:none; }
+  .doc-status { display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); margin:0 2px 8px; }
+  .doc-status.error, .doc-status.lost { color:var(--red); }
+  .doc-summary { display:none; font-size:12.5px; color:var(--muted); margin:0 2px 8px; font-variant-numeric:tabular-nums; }
+  .doc-summary b { color:var(--text); font-weight:650; }
+  .doc-summary .v { color:var(--green); } .doc-summary .u { color:var(--amber); } .doc-summary .x { color:var(--red); }
+  .doc-filters { display:none; gap:8px; flex-wrap:wrap; margin:2px 2px 8px; }
+  .doc-count { font-size:12px; color:var(--muted); margin:0 2px 8px; }
+  .doc-list { display:flex; flex-direction:column; gap:10px; }
+
+  /* ---- PDF side panel: scroll the source PDF (jumped to the references
+     page) next to the candidate cards, so an assessor can compare what the
+     student wrote against the matched record without leaving the page. ---- */
+  .doc-body { display:flex; align-items:flex-start; gap:16px; }
+  .doc-main { flex:1; min-width:0; }
+  .doc-pdf-toggle {
+    display:none; flex:none; margin-left:auto; font-size:12px; font-weight:600;
+    color:var(--accent); cursor:pointer; user-select:none; white-space:nowrap;
+  }
+  .doc-pdf-toggle:hover { text-decoration:underline; }
+  .pdf-panel { display:none; flex:0 0 42%; min-width:280px; position:sticky; top:46px; }
+  .pdf-panel.open { display:block; }
+  .pdf-panel iframe {
+    width:100%; height:78vh; border:1px solid var(--line); border-radius:8px;
+    background:#fff; display:block;
+  }
+  @media (max-width:900px) {
+    .doc-body { flex-direction:column; }
+    .pdf-panel { flex:none; width:100%; position:static; }
+    .pdf-panel iframe { height:60vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reference Verifier</h1>
+  <div class="sub">Upload one or more thesis PDFs — references are extracted and checked against CrossRef, OpenAlex &amp; Semantic Scholar.</div>
+</header>
+
+<main>
+  <div id="drop">
+    <div><strong>Drag &amp; drop PDFs here</strong> or click to choose</div>
+    <div class="hint">One or more thesis PDFs — they're verified one after another.</div>
+  </div>
+  <input type="file" id="fileInput" accept="application/pdf,.pdf" multiple>
+  <div class="upload-row">
+    <span id="fileName" class="empty">No files selected.</span>
+    <button class="btn" id="verifyBtn" disabled>Verify</button>
+  </div>
+
+  <div id="error"></div>
+
+  <div id="status">
+    <span class="spinner" id="statusSpin"></span>
+    <span id="statusMsg"></span>
+  </div>
+
+  <div id="summary"></div>
+
+  <div id="filters">
+    <span class="chip f-Verified"   data-status="Verified">✓ Verified <span class="badge-n">0</span></span>
+    <span class="chip f-Uncertain"  data-status="Uncertain">? Uncertain <span class="badge-n">0</span></span>
+    <span class="chip f-Unverified" data-status="Unverified">✗ Unverified <span class="badge-n">0</span></span>
+    <span class="chip f-Web"        data-web="1">🔗 Web / URL <span class="badge-n">0</span></span>
+  </div>
+
+  <div id="listWrap">
+    <div id="count"></div>
+    <div id="docs"></div>
+  </div>
+</main>
+
+<script>
+const drop       = document.getElementById("drop");
+const fileInput  = document.getElementById("fileInput");
+const fileNameEl = document.getElementById("fileName");
+const verifyBtn  = document.getElementById("verifyBtn");
+const errorBox   = document.getElementById("error");
+const statusBar  = document.getElementById("status");
+const statusSpin = document.getElementById("statusSpin");
+const statusMsg  = document.getElementById("statusMsg");
+const summaryEl  = document.getElementById("summary");
+const filtersEl  = document.getElementById("filters");
+const listWrap   = document.getElementById("listWrap");
+const docsEl     = document.getElementById("docs");
+const countEl    = document.getElementById("count");
+
+// ---- State ----
+let selectedFiles = [];   // queue of File objects to verify, in order
+const docs = [];          // per-thesis doc objects, in display order
+let running = false;
+
+
+// Normalise raw KB source strings for display.
+const SOURCE_LABELS = {
+  CrossRef_DOI:          "CrossRef DOI",
+  CrossRef_title:        "CrossRef title",
+  OpenAlex_title:        "OpenAlex title",
+  SemanticScholar_title: "Semantic Scholar title",
+  arXiv_DOI:             "arXiv DOI",
+  Web:                   "Web",
+  Web_fallback:          "Web",
+};
+function sourceLabel(s) {
+  if (!s) return null;
+  if (SOURCE_LABELS[s]) return SOURCE_LABELS[s];
+  return String(s).replace(/_/g, " ");   // graceful fallback for unknown sources
+}
+
+// ---- Upload wiring ----
+drop.addEventListener("click", () => fileInput.click());
+["dragenter","dragover"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("drag"); }));
+["dragleave","drop"].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
+drop.addEventListener("drop", e => selectFiles(e.dataTransfer.files));
+fileInput.addEventListener("change", () => selectFiles(fileInput.files));
+verifyBtn.addEventListener("click", () => {
+  if (selectedFiles.length && !running) startVerifyAll(selectedFiles);
+});
+
+function isPdf(f) {
+  return f.name.toLowerCase().endsWith(".pdf") || f.type === "application/pdf";
+}
+
+function selectFiles(fileList) {
+  const pdfs = [...fileList].filter(isPdf);
+  if (pdfs.length === 0) {
+    showError("Please choose one or more PDF files.");
+    return;
+  }
+  errorBox.style.display = "none";
+  selectedFiles = pdfs;
+  fileNameEl.textContent = pdfs.length === 1
+    ? pdfs[0].name
+    : `${pdfs.length} files selected — ${pdfs.map(f => f.name).join(", ")}`;
+  fileNameEl.classList.remove("empty");
+  verifyBtn.disabled = false;
+}
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.style.display = "block";
+}
+
+// ---- Helpers ----
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+}
+function authorsText(authors) {
+  if (Array.isArray(authors)) return authors.join("; ");
+  return authors ? String(authors) : "";
+}
+
+// Render the per-field verification checklist (title / authors / year / journal).
+// Keys are omitted by the LLM when a field's status is unknown, so we only show
+// what's present.
+function renderChecks(checks) {
+  if (!checks) return "";
+  const labels = { title: "Title", authors: "Authors", year: "Year", journal: "Journal" };
+  const rows = Object.entries(checks).map(([key, val]) => {
+    if (!val) return "";
+    const label = labels[key] || key;
+    const note  = val.note ? `<span class="chk-note">— ${escapeHtml(val.note)}</span>` : "";
+    if (val.status === "match")    return `<span class="chk-item"><span class="chk-ok">✓ ${label}</span>${note}</span>`;
+    if (val.status === "partial")  return `<span class="chk-item"><span class="chk-warn">⚠ ${label}: partial</span>${note}</span>`;
+    if (val.status === "mismatch") return `<span class="chk-item"><span class="chk-bad">✗ ${label}: mismatch</span>${note}</span>`;
+    if (val.status === "info")     return `<span class="chk-item"><span class="chk-info">ℹ ${label}</span>${note}</span>`;
+    return "";
+  }).filter(Boolean);
+  if (!rows.length) return "";
+  return `<div class="checklist">${rows.join("")}</div>`;
+}
+
+// Build a "year · journal" meta line, omitting whichever part is missing.
+function metaLine(year, journal) {
+  const parts = [];
+  if (year !== null && year !== undefined && year !== "") parts.push(String(year));
+  if (journal) parts.push(journal);
+  return parts.join(" · ");
+}
+
+// Side-by-side comparison: student's original reference (left) vs the
+// matched KB/web record the pipeline compared it against (right), so an
+// assessor can sanity-check the LLM's verdict against the original evidence.
+// Not shown for DOI-resolved Verified results — matched_candidate is null
+// there by design, since a DOI hit is treated as definitive on its own.
+//
+// Each side also gets its own "Open" link when available: the student's
+// own provided URL (or a doi.org link built from their cited DOI) on the
+// left, and the candidate's resolved link (r.url — already computed by
+// the backend from whichever record was matched) on the right. Showing
+// both side by side lets an assessor click through and confirm the
+// candidate really is the same source the student cited, not just a
+// same-titled lookalike — this is especially relevant for Uncertain
+// results flagged due to a DOI mismatch, where the two links may point
+// to genuinely different papers.
+function studentLink(r) {
+  if (r.student_url) return r.student_url;
+  if (r.doi) {
+    const doi = String(r.doi).replace(/^https?:\/\/doi\.org\//i, "");
+    return `https://doi.org/${doi}`;
+  }
+  return null;
+}
+
+function renderCompare(r) {
+  const c = r.matched_candidate;
+  if (!c) return "";
+
+  const origAuthors = authorsText(r.authors) || "—";
+  const origMeta     = metaLine(r.year, r.journal) || "—";
+  const origUrl = studentLink(r);
+  const origLink = origUrl
+    ? `<a class="openlink" href="${escapeHtml(origUrl)}" target="_blank" rel="noopener">↗ Open link</a>`
+    : "";
+
+  const candAuthors = authorsText(c.authors) || "—";
+  const candMeta     = metaLine(c.year, c.journal);
+  const candDesc = c.description
+    ? `<div class="compare-desc">${escapeHtml(c.description)}</div>` : "";
+  const candLink = r.url
+    ? `<a class="openlink" href="${escapeHtml(r.url)}" target="_blank" rel="noopener">↗ Open link</a>`
+    : "";
+
+  const kbLabel = sourceLabel(r.source) || "Matched record";
+
+  return `
+    <div class="compare">
+      <div class="compare-col orig">
+        <div class="compare-label">Student's reference</div>
+        <div class="compare-title">${escapeHtml(r.title || "(untitled)")}</div>
+        <div class="compare-meta"><span class="lbl">Authors:</span> ${escapeHtml(origAuthors)}</div>
+        <div class="compare-meta">${escapeHtml(origMeta)}</div>
+        ${origLink ? `<div class="compare-meta">${origLink}</div>` : ""}
+      </div>
+      <div class="compare-col kb">
+        <div class="compare-label">${escapeHtml(kbLabel)}</div>
+        ${c.title
+          ? `<div class="compare-title">${escapeHtml(c.title)}</div>`
+          : `<div class="compare-empty">No title retrieved.</div>`}
+        <div class="compare-meta"><span class="lbl">Authors:</span> ${escapeHtml(candAuthors)}</div>
+        <div class="compare-meta">${escapeHtml(candMeta || "—")}</div>
+        ${candDesc}
+        ${candLink ? `<div class="compare-meta">${candLink}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+// ---- Card rendering ----
+function cardHtml(r) {
+  const status = r.status || "Pending";
+  const pending = status === "Pending";
+  const year = (r.year ?? null) !== null ? ` <span class="year">(${escapeHtml(r.year)})</span>` : "";
+  const authors = authorsText(r.authors);
+  const hasCompare = !pending && !!r.matched_candidate;
+
+  let foot = "";
+  if (pending) {
+    foot = `<div class="verifying"><span class="spinner"></span>Verifying…</div>`;
+  } else {
+    // Side-by-side comparison panel (when a KB/web candidate was matched).
+    const compareHtml = renderCompare(r);
+    // Per-field verification checklist — shown whenever the pipeline recorded
+    // one, regardless of status (Uncertain results carry checks too, e.g.
+    // a partial author match or a journal mismatch).
+    const checksHtml = renderChecks(r.checks);
+    // Reason text for Uncertain / Unverified.
+    const reasonHtml = (status !== "Verified" && r.reason)
+      ? `<p class="ref-reason">${escapeHtml(r.reason)}</p>` : "";
+    // Footer: source pill, plus a fallback link ONLY when there's no
+    // comparison panel to put one in (e.g. DOI-resolved Verified results,
+    // where matched_candidate is null by design and renderCompare renders
+    // nothing). When a comparison panel exists, both the student's link
+    // and the candidate's link are already shown there — repeating one
+    // here would be redundant.
+    const src = sourceLabel(r.source);
+    const srcPill = src ? `<span class="source">${escapeHtml(src)}</span>` : "";
+    const fallbackUrl = !hasCompare ? (studentLink(r) || r.url) : null;
+    const link = fallbackUrl
+      ? `<a class="openlink" href="${escapeHtml(fallbackUrl)}" target="_blank" rel="noopener">↗ Open link</a>`
+      : "";
+    const footRow = (srcPill || link) ? `<div class="card-foot">${srcPill}${link}</div>` : "";
+    foot = compareHtml + checksHtml + reasonHtml + footRow;
+  }
+
+  return `
+    <div class="card-head">
+      <span class="badge ${escapeHtml(status)}">${escapeHtml(status)}</span>
+      <span class="card-title">${escapeHtml(r.title || "(untitled)")}${year}</span>
+      <span class="card-id">#${escapeHtml(r.id)}</span>
+    </div>
+    ${(!hasCompare && authors) ? `<div class="authors"><span class="lbl">Authors:</span> ${escapeHtml(authors)}</div>` : ""}
+    ${foot}`;
+}
+
+// Cards are namespaced by document index — per-PDF reference numbering restarts
+// at 1, so a global id would collide across documents.
+function upsertCard(doc, r) {
+  const cardId = `card-${doc.index}-${r.id}`;
+  let el = document.getElementById(cardId);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = cardId;
+    el.className = "card";
+    doc.listEl.appendChild(el);
+  }
+  el.classList.toggle("pending", (r.status || "Pending") === "Pending");
+  el.dataset.status = r.status || "Pending";
+  el.dataset.isWeb = String(!!r.is_web);
+  el.innerHTML = cardHtml(r);
+}
+
+// ---- Filtering ----
+// Two filter bars apply: the global bar (#filters) and each thesis's own bar.
+// For one bar: no active status chips -> show all; otherwise the card must match
+// an active status. The Web/URL chip, when active, restricts to web references.
+// A card is shown only if it passes BOTH the global bar AND its thesis's bar.
+function cardPasses(card, barEl) {
+  const activeStatuses = ['Verified', 'Uncertain', 'Unverified']
+    .filter(s => barEl.querySelector(`.chip.f-${s}`)?.classList.contains('on'));
+  const webOnly   = barEl.querySelector('.chip.f-Web')?.classList.contains('on');
+  const statusOk  = activeStatuses.length === 0 || activeStatuses.includes(card.dataset.status);
+  const webOk     = !webOnly   || card.dataset.isWeb === 'true';
+  return statusOk && webOk;
+}
+
+function applyDocFilters(doc) {
+  const cards = doc.listEl.querySelectorAll('.card');
+  let visible = 0;
+  cards.forEach(card => {
+    const show = cardPasses(card, filtersEl) && cardPasses(card, doc.filtersEl);
+    card.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+  doc.countEl.textContent = `Showing ${visible} of ${cards.length} reference${cards.length !== 1 ? 's' : ''}`;
+  updateGlobalCount();
+}
+
+// Re-filter every thesis — used when a global chip changes.
+function applyAllFilters() { docs.forEach(applyDocFilters); }
+
+function updateGlobalCount() {
+  const visible = countCards(docsEl, '.card:not([style*="display: none"])');
+  const total = countCards(docsEl, '.card');
+  countEl.textContent = total
+    ? `Showing ${visible} of ${total} reference${total !== 1 ? 's' : ''} across ${docs.length} file${docs.length !== 1 ? 's' : ''}`
+    : '';
+}
+
+// Counts are read from the DOM so they reflect live progress.
+function countCards(scope, selector) {
+  return scope.querySelectorAll(selector).length;
+}
+
+// Global filter-bar badges — counts aggregate across every thesis.
+function updateBadges() {
+  setBadge(filtersEl, "Verified",   countCards(docsEl, '.card[data-status="Verified"]'));
+  setBadge(filtersEl, "Uncertain",  countCards(docsEl, '.card[data-status="Uncertain"]'));
+  setBadge(filtersEl, "Unverified", countCards(docsEl, '.card[data-status="Unverified"]'));
+  filtersEl.querySelector('.chip[data-web] .badge-n').textContent =
+    countCards(docsEl, '.card[data-is-web="true"]');
+}
+
+// One thesis's filter-bar badges — counts within that thesis only.
+function updateDocBadges(doc) {
+  setBadge(doc.filtersEl, "Verified",   countCards(doc.listEl, '.card[data-status="Verified"]'));
+  setBadge(doc.filtersEl, "Uncertain",  countCards(doc.listEl, '.card[data-status="Uncertain"]'));
+  setBadge(doc.filtersEl, "Unverified", countCards(doc.listEl, '.card[data-status="Unverified"]'));
+  doc.filtersEl.querySelector('.chip[data-web] .badge-n').textContent =
+    countCards(doc.listEl, '.card[data-is-web="true"]');
+}
+
+function setBadge(barEl, status, n) {
+  barEl.querySelector(`.chip[data-status="${status}"] .badge-n`).textContent = n;
+}
+
+// Markup for one filter bar's four chips (used by the global bar and each thesis).
+function chipBarHtml() {
+  return `<span class="chip f-Verified"   data-status="Verified">✓ Verified <span class="badge-n">0</span></span>` +
+         `<span class="chip f-Uncertain"  data-status="Uncertain">? Uncertain <span class="badge-n">0</span></span>` +
+         `<span class="chip f-Unverified" data-status="Unverified">✗ Unverified <span class="badge-n">0</span></span>` +
+         `<span class="chip f-Web"        data-web="1">🔗 Web / URL <span class="badge-n">0</span></span>`;
+}
+
+// Build a "N references · V · U · X" line from the cards within a scope element.
+function summaryHtml(scope, label) {
+  const n = countCards(scope, '.card');
+  const v = countCards(scope, '.card[data-status="Verified"]');
+  const u = countCards(scope, '.card[data-status="Uncertain"]');
+  const x = countCards(scope, '.card[data-status="Unverified"]');
+  return `<b>${n}</b> ${label}${n === 1 ? "" : "s"} · ` +
+    `<b class="v">${v}</b> Verified · <b class="u">${u}</b> Uncertain · <b class="x">${x}</b> Unverified`;
+}
+
+// ---- Global filter chip wiring ----
+// Each chip toggles its own `on` class independently — no radio behaviour.
+// Per-thesis chips are wired in createDoc(). A global chip re-filters all theses.
+filtersEl.querySelectorAll(".chip").forEach(chip => {
+  chip.addEventListener("click", () => {
+    chip.classList.toggle("on");
+    applyAllFilters();
+  });
+});
+
+// ---- Summary ----
+// Global aggregate across every document, shown once the whole queue finishes.
+function showSummary() {
+  const files = selectedFiles.length;
+  summaryEl.innerHTML = summaryHtml(docsEl, "reference") +
+    ` &nbsp;·&nbsp; across <b>${files}</b> file${files === 1 ? "" : "s"}`;
+  summaryEl.style.display = "block";
+}
+
+// ---- Global status bar ----
+function setStatus(msg, { done = false } = {}) {
+  statusBar.style.display = "flex";
+  statusBar.classList.remove("lost");
+  statusBar.classList.toggle("done", done);
+  statusSpin.style.display = done ? "none" : "";
+  statusMsg.textContent = msg;
+}
+
+// ---- Per-document group ----
+function createDoc(file, index, total) {
+  const wrap = document.createElement("div");
+  wrap.className = "doc";
+  wrap.innerHTML =
+    `<div class="doc-head">` +
+      `<span class="doc-toggle">▾</span>` +
+      `<span class="doc-name">${escapeHtml(file.name)}</span>` +
+      (total > 1 ? `<span class="doc-num">file ${index + 1} of ${total}</span>` : "") +
+      `<span class="doc-pdf-toggle">📄 View PDF</span>` +
+    `</div>` +
+    `<div class="doc-status"><span class="spinner"></span><span class="doc-status-msg">Queued…</span></div>` +
+    `<div class="doc-summary"></div>` +
+    `<div class="doc-body">` +
+      `<div class="pdf-panel"><iframe loading="lazy" title="Source PDF"></iframe></div>` +
+      `<div class="doc-main">` +
+        `<div class="doc-filters">${chipBarHtml()}</div>` +
+        `<div class="doc-count"></div>` +
+        `<div class="doc-list"></div>` +
+      `</div>` +
+    `</div>`;
+  docsEl.appendChild(wrap);
+
+  const doc = {
+    index,
+    wrap,
+    listEl:        wrap.querySelector(".doc-list"),
+    statusEl:      wrap.querySelector(".doc-status"),
+    statusMsg:     wrap.querySelector(".doc-status-msg"),
+    summaryEl:     wrap.querySelector(".doc-summary"),
+    filtersEl:     wrap.querySelector(".doc-filters"),
+    countEl:       wrap.querySelector(".doc-count"),
+    pdfToggleEl:   wrap.querySelector(".doc-pdf-toggle"),
+    pdfPanelEl:    wrap.querySelector(".pdf-panel"),
+    pdfIframeEl:   wrap.querySelector(".pdf-panel iframe"),
+    collapsed: false,
+    pdfToken: null,   // set once the "extracted" SSE event arrives
+    pdfPage: 1,        // 1-based page to jump the viewer to (references heading)
+    pdfLoaded: false,  // iframe.src is set lazily, only on first open
+  };
+
+  // Collapse / expand on header click — hides this thesis's filter bar + list
+  // (its status and summary stay visible).
+  wrap.querySelector(".doc-head").addEventListener("click", () => {
+    doc.collapsed = !doc.collapsed;
+    wrap.classList.toggle("collapsed", doc.collapsed);
+  });
+
+  // "View PDF" toggle — stopPropagation so it doesn't also fire the
+  // collapse handler above. The iframe src is only set the first time the
+  // panel opens, so PDFs that are never viewed are never fetched.
+  doc.pdfToggleEl.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const open = doc.pdfPanelEl.classList.toggle("open");
+    doc.pdfToggleEl.textContent = open ? "📄 Hide PDF" : "📄 View PDF";
+    if (open && doc.pdfToken && !doc.pdfLoaded) {
+      doc.pdfIframeEl.src = `/pdf/${doc.pdfToken}#page=${doc.pdfPage}`;
+      doc.pdfLoaded = true;
+    }
+  });
+
+  // Per-thesis filter chips — filter only this thesis's cards.
+  doc.filtersEl.querySelectorAll(".chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      chip.classList.toggle("on");
+      applyDocFilters(doc);
+    });
+  });
+
+  docs.push(doc);
+  return doc;
+}
+
+function setDocStatus(doc, msg, { error = false, lost = false } = {}) {
+  doc.statusEl.style.display = "flex";
+  doc.statusEl.className = "doc-status" + (error ? " error" : "") + (lost ? " lost" : "");
+  const spin = doc.statusEl.querySelector(".spinner");
+  if (spin) spin.style.display = (error || lost) ? "none" : "";
+  doc.statusMsg.textContent = msg;
+}
+
+function showDocSummary(doc) {
+  doc.statusEl.style.display = "none";
+  doc.summaryEl.innerHTML = summaryHtml(doc.listEl, "reference");
+  doc.summaryEl.style.display = "block";
+}
+
+// ---- Run ----
+function resetRun() {
+  docs.length = 0;
+  docsEl.innerHTML = "";
+  errorBox.style.display = "none";
+  summaryEl.style.display = "none";
+  filtersEl.style.display = "none";
+  listWrap.style.display = "none";
+  statusBar.classList.remove("lost", "done");
+}
+
+// Verify the whole queue sequentially — one /verify request per PDF. Sequential
+// (not parallel) keeps within the pipeline's API rate limits.
+async function startVerifyAll(files) {
+  resetRun();
+  running = true;
+  verifyBtn.disabled = true;
+  filtersEl.style.display = "flex";
+  listWrap.style.display = "block";
+
+  for (let i = 0; i < files.length; i++) {
+    setStatus(`Verifying file ${i + 1} of ${files.length}: ${files[i].name}…`);
+    const doc = createDoc(files[i], i, files.length);
+    await verifyOne(doc, files[i]);
+  }
+
+  running = false;
+  verifyBtn.disabled = selectedFiles.length === 0;
+  showSummary();
+  setStatus(`All ${files.length} file${files.length === 1 ? "" : "s"} complete.`, { done: true });
+}
+
+// Returns a promise that resolves when this file's stream ends (success, error,
+// or dropped connection) so the queue can move to the next file.
+function verifyOne(doc, file) {
+  setDocStatus(doc, "Uploading…");
+  const form = new FormData();
+  form.append("pdf", file);
+
+  let gotDone = false, gotError = false;
+
+  return fetch("/verify", { method: "POST", body: form })
+    .then(resp => {
+      if (!resp.ok) throw new Error("Server returned " + resp.status);
+      return readStream(resp.body.getReader(), ev => {
+        if (ev === "done") gotDone = true;
+        if (ev === "error") gotError = true;
+      }, doc);
+    })
+    .then(() => {
+      // Stream ended without a done/error frame -> the connection dropped.
+      if (!gotDone && !gotError) setDocStatus(doc, "Connection lost — please retry.", { lost: true });
+    })
+    .catch(() => {
+      if (!gotDone && !gotError) setDocStatus(doc, "Connection lost — please retry.", { lost: true });
+    });
+}
+
+// Parse the SSE byte stream manually (fetch + ReadableStream — EventSource
+// can't POST a file body). Returns a promise that resolves when the stream ends.
+function readStream(reader, onEvent, doc) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  function pump() {
+    return reader.read().then(({ done, value }) => {
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        handleFrame(frame, onEvent, doc);
+      }
+      return pump();
+    });
+  }
+  return pump();
+}
+
+function handleFrame(frame, onEvent, doc) {
+  let event = "message", data = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).trim();
+  }
+  if (!data) return;
+  let payload;
+  try { payload = JSON.parse(data); } catch { return; }
+  if (onEvent) onEvent(event);
+
+  switch (event) {
+    case "phase":
+      setDocStatus(doc, payload.message);
+      break;
+    case "extracted":
+      doc.filtersEl.style.display = "flex";   // reveal this thesis's filter bar
+      payload.references.forEach(r => { r.status = "Pending"; upsertCard(doc, r); });
+      updateBadges();
+      updateDocBadges(doc);
+      applyDocFilters(doc);
+      if (payload.pdf_token) {
+        doc.pdfToken = payload.pdf_token;
+        doc.pdfPage = payload.pdf_page || 1;
+        doc.pdfToggleEl.style.display = "inline-flex";
+        // Panel may already be open (e.g. re-verifying) — load straight away.
+        if (doc.pdfPanelEl.classList.contains("open") && !doc.pdfLoaded) {
+          doc.pdfIframeEl.src = `/pdf/${doc.pdfToken}#page=${doc.pdfPage}`;
+          doc.pdfLoaded = true;
+        }
+      }
+      break;
+    case "progress":
+      upsertCard(doc, payload.reference);
+      updateBadges();
+      updateDocBadges(doc);
+      applyDocFilters(doc);
+      break;
+    case "done":
+      payload.references.forEach(r => upsertCard(doc, r));
+      updateBadges();
+      updateDocBadges(doc);
+      showDocSummary(doc);
+      applyDocFilters(doc);
+      break;
+    case "error":
+      setDocStatus(doc, payload.message, { error: true });
+      break;
+  }
+}
+</script>
+</body>
+</html>
