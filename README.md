@@ -2,6 +2,22 @@
 
 A web-based artifact built for a BSc Business Analytics thesis (University of Amsterdam) on AI-powered academic reference verification. Given a thesis PDF, it extracts the reference list and verifies each entry's existence using a fixed six-step LLM cascade, streaming per-reference results to the browser as they complete.
 
+## Repo structure
+
+All code lives in the `Reference Verification Model/` folder:
+
+```
+AI-Powered-Reference-Verification-Tool/
+├── README.md
+├── .gitignore
+└── Reference Verification Model/
+    ├── app.py
+    ├── extract_references.py
+    ├── verify_pipeline.py
+    ├── requirements.txt
+    └── static/
+```
+
 ## What it does
 
 1. **Extraction** — `extract_references.py` locates the references section in the uploaded PDF (via PyMuPDF), then uses an LLM (GPT-4.1) to parse it into structured reference records (authors, title, year, DOI, URL, journal, reference type).
@@ -10,7 +26,7 @@ A web-based artifact built for a BSc Business Analytics thesis (University of Am
    - Step 2: DOI check (CrossRef → arXiv via Semantic Scholar, Levenshtein + LLM fallback)
    - Steps 3–5: Title cascade (CrossRef → OpenAlex → Semantic Scholar, top-5 candidates, LLM comparison)
    - Step 6: Non-DOI URL fallback
-   
+
    Each reference resolves to **Verified**, **Uncertain**, or **Unverified**.
 3. **Interface** — `app.py` (Flask) serves the frontend and streams progress via Server-Sent Events (SSE) as each reference is processed, so results appear incrementally rather than after a single long wait.
 
@@ -25,18 +41,21 @@ A web-based artifact built for a BSc Business Analytics thesis (University of Am
 ## Requirements
 
 - Python 3.10+
-- A `.env` file (not included — see below) with your LLM proxy credentials:
+- A `.env` file (not included — see below), placed inside `Reference Verification Model/`, with your credentials:
   ```
   OPENAI_API_KEY=...
   OPENAI_API_BASE=...
   OPENALEX_API_KEY=...
+  S2_API_KEY=...
   ```
-- Dependencies:
+  - `OPENALEX_API_KEY` — free key from openalex.org/settings/api
+  - `S2_API_KEY` — Semantic Scholar API key, used for a higher rate limit when querying S2
+- Dependencies listed in `Reference Verification Model/requirements.txt`:
   ```
-  flask
+  Flask
   openai
   python-dotenv
-  pymupdf
+  PyMuPDF
   python-Levenshtein
   beautifulsoup4
   requests
@@ -46,11 +65,11 @@ A web-based artifact built for a BSc Business Analytics thesis (University of Am
 
 ```bash
 git clone https://github.com/JeremyFragnay/AI-Powered-Reference-Verification-Tool.git
-cd AI-Powered-Reference-Verification-Tool
-pip install flask openai python-dotenv pymupdf python-Levenshtein beautifulsoup4 requests
+cd AI-Powered-Reference-Verification-Tool/"Reference Verification Model"
+pip install -r requirements.txt
 ```
 
-Create a `.env` file in the project root with the credentials listed above, then run:
+Create a `.env` file in this same folder with the credentials listed above, then run:
 
 ```bash
 python app.py
