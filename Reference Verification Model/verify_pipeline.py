@@ -10,51 +10,58 @@ Design principle: the LLM compares retrieved candidates against the query; it
 never uses its own parametric knowledge.
 """
 
-# -- Setup -------------------------------------------------------------------
-import json, time, requests, os, random
+import json
+import os
+import random
 import re
-from bs4 import BeautifulSoup
-from openai import OpenAI
-from dotenv import load_dotenv
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse, urlunparse
+
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from Levenshtein import ratio as lev_ratio
+from openai import OpenAI
+import requests
 
-EMAIL       = "jeremy.fragnay@student.uva.nl"
-CR_DELAY    = 1.5   # CrossRef polite pool pause between calls
-DOI_TITLE_THRESHOLD = 0.8  # Levenshtein ratio — same as CheckIfExist and evaluation script
+# -- Setup & Configuration ---------------------------------------------------
 
-# Load credentials from the .env file next to this module (UvA LiteLLM proxy).
-# Mirrors extract_references.py so behaviour is identical regardless of cwd.
-_HERE = os.path.dirname(os.path.abspath(__file__))
+EMAIL: str = "example@email.com" # Add your own email here 
+CR_DELAY: float = 1.5           # Polite delay between CrossRef API calls
+DOI_TITLE_THRESHOLD: float = 0.8  # Levenshtein ratio matching constraint
+
+# Load credentials relative to this script's path (mirrors extract_references.py context)
+_HERE: str = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_HERE, ".env"))
 
-S2_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-client = OpenAI(
+S2_API_KEY: Optional[str] = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+client: OpenAI = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     base_url=os.getenv("OPENAI_API_BASE")
 )
 
+# Global tracking dictionary for LLM metrics across steps
+llm_usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
 
-def title_matches(query_title, retrieved_title):
-    """Returns True if normalised Levenshtein ratio >= DOI_TITLE_THRESHOLD."""
+
+def title_matches(query_title: Optional[str], retrieved_title: Optional[str]) -> bool:
+    """Evaluates whether normalized titles meet the similarity metric threshold.
+
+    Args:
+        query_title: The reference title parsed from the thesis source.
+        retrieved_title: The candidate title pulled from an external database.
+
+    Returns:
+        True if the normalized Levenshtein ratio >= DOI_TITLE_THRESHOLD, else False.
+    """
     if not query_title or not retrieved_title:
         return False
     return lev_ratio(query_title.lower().strip(), retrieved_title.lower().strip()) >= DOI_TITLE_THRESHOLD
 
 
-# -- Step 1: Website check ---------------------------------------------------
-# For website-type references, stream the first ~64 KB of HTML, extract
-# <title> and <meta name="description">, then use the LLM to judge whether
-# the page content matches the reference title.
-# check_website() has exactly two possible outcomes:
-#   Verified   -> page is live AND LLM confirms title/description match.
-#   Unverified -> anything else (dead link after retries, connection error
-#                 after retries, 403, other HTTP >=400, no metadata to compare,
-#                 or LLM judges no match / LLM call failed after retries).
-# Transient failures (HTTP 500/502/503/504, connection errors, timeouts) are
-# retried inside _extract_page_metadata before falling through to Unverified.
+# -- Step 1: Website Check Elements ------------------------------------------
 
-COMPARATOR_PROMPT_WEB = """You are a reference verification assistant. Your only job is to determine whether a web page's metadata matches the reference title provided.
+COMPARATOR_PROMPT_WEB: str = """You are a reference verification assistant. Your only job is to determine whether a web page's metadata matches the reference title provided.
 
 Do not use your own knowledge. Only compare the metadata provided.
 
@@ -68,16 +75,27 @@ Respond in JSON only, no other text:
 
 
 def _extract_page_metadata(url: str, max_bytes: int = 65536, retries: int = 2, retry_delay: float = 3.0) -> dict:
-    """Stream the first max_bytes of a URL and extract <title> and <meta description>.
-    Retries on transient server errors (500, 502, 503, 504) and on connection
-    errors (DNS failure, refused connection, timeout) — both may be transient."""
+    """Streams a portion of a URL's response to harvest its HTML title and description tags.
+
+    Protects resources by only scanning up to max_bytes. Gracefully backs off and retries
+    on common connection timeouts or transient server anomalies (HTTP 50x errors).
+
+    Args:
+        url: Target web resource link location.
+        max_bytes: Maximum chunk constraint for streaming HTML responses.
+        retries: How many additional request attempts to fulfill on transient issues.
+        retry_delay: Wait time in seconds between subsequent retry attempts.
+
+    Returns:
+        A dictionary containing the parsed metadata fields:
+        {"status_code": int or None, "title": str, "description": str}
+    """
     headers = {"User-Agent": f"ThesisVerifier ({EMAIL})"}
     RETRYABLE = {500, 502, 503, 504}
 
     for attempt in range(retries + 1):
         try:
-            with requests.get(url, stream=True, timeout=15, allow_redirects=True,
-                              headers=headers) as r:
+            with requests.get(url, stream=True, timeout=15, allow_redirects=True, headers=headers) as r:
                 if r.status_code == 403:
                     return {"status_code": 403, "title": "", "description": ""}
                 if r.status_code in RETRYABLE and attempt < retries:
@@ -86,6 +104,7 @@ def _extract_page_metadata(url: str, max_bytes: int = 65536, retries: int = 2, r
                     continue
                 if r.status_code >= 400:
                     return {"status_code": r.status_code, "title": "", "description": ""}
+                
                 chunk = b""
                 for data in r.iter_content(chunk_size=1024):
                     chunk += data
@@ -94,7 +113,6 @@ def _extract_page_metadata(url: str, max_bytes: int = 65536, retries: int = 2, r
                 status_code = r.status_code
 
             soup = BeautifulSoup(chunk.decode("utf-8", errors="ignore"), "html.parser")
-
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
             desc_tag = (
@@ -117,7 +135,16 @@ def _extract_page_metadata(url: str, max_bytes: int = 65536, retries: int = 2, r
     return {"status_code": None, "title": "", "description": "Max retries exceeded."}
 
 
-def check_website(url, ref_title: str = ""):
+def check_website(url: str, ref_title: str = "") -> Tuple[str, str, str, Optional[dict]]:
+    """Evaluates website-type reference strings against the target site metadata using an LLM.
+
+    Args:
+        url: String web destination.
+        ref_title: Expected document or context item title string.
+
+    Returns:
+        A tuple mapping (label, source, reason, page_candidate_dict) outcomes.
+    """
     if not url.startswith("http"):
         url = "https://" + url
     parsed = urlparse(url)
@@ -127,9 +154,6 @@ def check_website(url, ref_title: str = ""):
     meta = _extract_page_metadata(url)
     status_code = meta["status_code"]
 
-    # --- Liveness failures (after retries in _extract_page_metadata) ---
-    # No page content was retrieved, so there is nothing to show as a
-    # comparison candidate.
     if status_code is None:
         return "Unverified", "Web", "Connection error after retries — domain may not exist.", None
     if status_code == 403:
@@ -137,19 +161,17 @@ def check_website(url, ref_title: str = ""):
     if status_code >= 400:
         return "Unverified", "Web", f"HTTP {status_code} — page may have moved.", None
 
-    # --- Page is live: semantic check ---
     page_title = meta["title"]
-    page_desc  = meta["description"]
+    page_desc = meta["description"]
     page_candidate = {
-        "title":       page_title or None,
-        "authors":     None,
-        "year":        None,
-        "journal":     None,
-        "doi":         None,
+        "title": page_title or None,
+        "authors": None,
+        "year": None,
+        "journal": None,
+        "doi": None,
         "description": page_desc or None,
     }
 
-    # If no reference title provided, fall back to pure liveness.
     if not ref_title or (not page_title and not page_desc):
         return "Unverified", "Web", f"HTTP {status_code} — page live; no metadata extracted for semantic check.", page_candidate
 
@@ -158,6 +180,7 @@ def check_website(url, ref_title: str = ""):
         f"Page <title>: {page_title}\n"
         f"Page <meta description>: {page_desc}"
     )
+    
     for attempt in range(3):
         try:
             response = client.chat.completions.create(
@@ -170,9 +193,10 @@ def check_website(url, ref_title: str = ""):
                 temperature=0,
                 max_tokens=100
             )
-            llm_usage["input_tokens"]  += response.usage.prompt_tokens
+            llm_usage["input_tokens"] += response.usage.prompt_tokens
             llm_usage["output_tokens"] += response.usage.completion_tokens
-            llm_usage["calls"]         += 1
+            llm_usage["calls"] += 1
+            
             result = json.loads(response.choices[0].message.content)
             if result.get("match"):
                 note = result.get("note") or f"Page title: '{page_title}'"
@@ -183,21 +207,12 @@ def check_website(url, ref_title: str = ""):
         except Exception as e:
             time.sleep(2 ** attempt)
 
-    # LLM failed — fall back to liveness only
     return "Unverified", "Web", f"HTTP {status_code} — LLM semantic check failed after retries; manual review required.", page_candidate
 
 
-# -- LLM comparator (Steps 2-5) ---------------------------------------------
-# GPT-4.1 compares retrieved candidates against the query reference.
-# Used as LLM fallback in Step 2 when Levenshtein fails, and as primary
-# comparator in the title search cascade (Steps 3-5).
-# Does NOT use the model's own knowledge — KB match is the only arbiter.
+# -- LLM Knowledgebase Candidate Comparators (Steps 2-5) ---------------------
 
-llm_usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
-
-# Used in Step 2 (DOI check): prefix matching allowed because a DOI-resolved
-# title may omit subtitles from the reference as stored in the KB.
-COMPARATOR_PROMPT_DOI = """You are a reference verification assistant. Your only job is to determine whether a candidate record retrieved via DOI lookup is the same publication as the query reference.
+COMPARATOR_PROMPT_DOI: str = """You are a reference verification assistant. Your only job is to determine whether a candidate record retrieved via DOI lookup is the same publication as the query reference.
 
 Do not use your own knowledge. Only compare the metadata provided.
 
@@ -236,10 +251,7 @@ Respond in JSON only, no other text:
   } or null
 }"""
 
-# Used in Steps 3-5 (title search cascade): prefix matching not applied.
-# Candidates are retrieved by title query so a partial title match is not
-# sufficient evidence — the full title must be substantially the same.
-COMPARATOR_PROMPT_TITLE = """You are a reference verification assistant. Your only job is to determine whether any candidate paper retrieved from an academic database is the same publication as the query reference.
+COMPARATOR_PROMPT_TITLE: str = """You are a reference verification assistant. Your only job is to determine whether any candidate paper retrieved from an academic database is the same publication as the query reference.
 
 Do not use your own knowledge. Only compare the metadata provided.
 
@@ -268,16 +280,27 @@ Respond in JSON only, no other text:
   } or null
 }"""
 
-def llm_compare(ref, candidates, prompt=COMPARATOR_PROMPT_TITLE):
-    if not candidates:
-        return {"match": False, "matched_candidate": None,
-                "confidence": "high", "reason": None}
 
-    def _format_candidate(i, c):
+def llm_compare(ref: dict, candidates: List[dict], prompt: str = COMPARATOR_PROMPT_TITLE) -> dict:
+    """Invokes the LLM evaluator to perform isolated structural cross-checks on metadata items.
+
+    Args:
+        ref: Query reference record data dict.
+        candidates: A curated collection list of dataset search items.
+        prompt: Task configuration context instruction string.
+
+    Returns:
+        Structured evaluation verification check outputs formatted via JSON mappings.
+    """
+    if not candidates:
+        return {"match": False, "matched_candidate": None, "confidence": "high", "reason": None}
+
+    def _format_candidate(i: int, c: dict) -> str:
         line = f"  {i+1}. Title: {c['title']} | Year: {c['year']} | Authors: {c['authors']}"
         if c.get("journal"):
             line += f" | Journal: {c['journal']}"
-        # Append CrossRef extra metadata when present (used by COMPARATOR_PROMPT_DOI)
+
+        
         extras = []
         if c.get("_doc_type"):
             extras.append(f"Type: {c['_doc_type']}")
@@ -291,9 +314,7 @@ def llm_compare(ref, candidates, prompt=COMPARATOR_PROMPT_TITLE):
             line += " | " + " | ".join(extras)
         return line
 
-    candidates_text = "\n".join(
-        _format_candidate(i, c) for i, c in enumerate(candidates)
-    )
+    candidates_text = "\n".join(_format_candidate(i, c) for i, c in enumerate(candidates))
     user_message = (
         f"Query reference:\n"
         f"- Title: {ref.get('title')}\n"
@@ -315,26 +336,22 @@ def llm_compare(ref, candidates, prompt=COMPARATOR_PROMPT_TITLE):
                 temperature=0,
                 max_tokens=200
             )
-            usage = response.usage
-            llm_usage["input_tokens"]  += usage.prompt_tokens
-            llm_usage["output_tokens"] += usage.completion_tokens
-            llm_usage["calls"]         += 1
+            llm_usage["input_tokens"] += response.usage.prompt_tokens
+            llm_usage["output_tokens"] += response.usage.completion_tokens
+            llm_usage["calls"] += 1
             return json.loads(response.choices[0].message.content)
         except Exception as e:
-            wait = 2 ** attempt
             print(f"  LLM error (attempt {attempt + 1}/3): {e}")
-            time.sleep(wait)
+            time.sleep(2 ** attempt)
 
     print(f"  LLM failed after 3 attempts for: {ref.get('title', '')[:60]}")
-    return {"match": False, "matched_candidate": None,
-            "confidence": "high", "reason": None}
+    return {"match": False, "matched_candidate": None, "confidence": "high", "reason": None}
 
 
-def _get_matched_url(candidates, matched_candidate_idx):
-    """Extract and normalise the DOI URL from the matched candidate.
-    CrossRef returns bare DOIs; OpenAlex returns full URIs already.
-    Returns None if no DOI is available for the matched candidate.
-    """
+# -- Internal Helper Utilities -----------------------------------------------
+
+def _get_matched_url(candidates: List[dict], matched_candidate_idx: Optional[int]) -> Optional[str]:
+    """Retrieves and constructs a sanitized DOI URL path for a matched candidate index target."""
     idx = (matched_candidate_idx or 1) - 1
     if not (0 <= idx < len(candidates)):
         idx = 0
@@ -342,35 +359,21 @@ def _get_matched_url(candidates, matched_candidate_idx):
     if not doi:
         return None
     if doi.startswith("http"):
-        return doi  # OpenAlex already provides a full URI
+        return doi
     return f"https://doi.org/{doi}"
 
 
-def _apply_doi_mismatch_downgrade(ref, label, reason):
-    """If the reference's own cited DOI resolved to a real record but that
-    record's title did NOT match the reference (set in Step 2 / Step 2b as
-    _doi_mismatch on ref["verification"]), and the title cascade
-    independently found and verified the correct paper by title alone,
-    downgrade Verified to Uncertain rather than letting it pass silently.
+def _apply_doi_mismatch_downgrade(ref: dict, label: str, reason: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Downgrades 'Verified' classifications to 'Uncertain' if a citation's listed DOI was faulty.
 
-    The underlying reference is real (hence the title-cascade match), but
-    the student cited a DOI that points to a different work — a genuine
-    citation defect distinct from "reference doesn't exist," and worth
-    flagging for human review rather than auto-clearing as Verified.
-
-    Existing Uncertain results (e.g. from an author/journal mismatch in
-    the cascade) get the DOI-mismatch note appended rather than replaced,
-    since both issues are independently true and worth surfacing.
-
-    Returns the (possibly adjusted) (label, reason) tuple. No-op if the
-    reference never had a DOI mismatch recorded.
+    Protects data validity when a reference title is ultimately located via cascade search,
+    but the original cited DOI resolved to an entirely unrelated paper resource.
     """
     doi_mismatch = ref["verification"].get("_doi_mismatch")
     if not doi_mismatch:
         return label, reason
 
-    note = (f"Cited DOI ({doi_mismatch}) resolves to a different paper; "
-            f"this reference was located independently by title.")
+    note = f"Cited DOI ({doi_mismatch}) resolves to a different paper; this reference was located independently by title."
     if label == "Verified":
         return "Uncertain", note
     if label == "Uncertain":
@@ -378,44 +381,15 @@ def _apply_doi_mismatch_downgrade(ref, label, reason):
     return label, reason
 
 
-def _cascade_outcome(ref, checks, candidate_journal=None):
-    """Given LLM checks for a title-cascade title match, decide whether the
-    reference should be labelled Verified or Uncertain.
+def _cascade_outcome(ref: dict, checks: dict, candidate_journal: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Analyzes contextual constraints (authorship/journals) to gauge absolute verification confidence.
 
-    A title match alone is no longer sufficient. Any one of the following
-    downgrades the result to Uncertain:
-      - authors check is "partial" (some but not all query authors found
-        in the candidate record) OR "mismatch" (none of the query authors
-        appear in the candidate record at all). A full mismatch is at least
-        as strong a signal as a partial one and must not be waved through
-        as Verified just because the title happened to line up.
-      - journal presence is asymmetric: the candidate (KB) record has a
-        journal name but the student's reference does not, OR the
-        student's reference gives a journal but the matched candidate
-        record has none. Either way, this side cannot be confirmed.
-      - journal check is "mismatch" (both sides give a journal name, but
-        the names clearly differ)
-
-    candidate_journal is the journal name from the matched KB candidate
-    (already resolved by the caller), independent of whatever the LLM
-    checks dict says — it is needed to detect the asymmetric-missing case
-    even when the LLM had nothing to compare (so never ran a journal check).
-
-    As a side effect, this also fills in checks["journal"] when the LLM
-    didn't already set one, so the comparison UI always shows a clear
-    match/mismatch verdict for the asymmetric case rather than a neutral
-    "info" row that looks like nothing is wrong.
-
-    `reason` is intentionally a short summary that POINTS AT the relevant
-    checklist row rather than restating its note text verbatim — the note
-    is already shown inline in the per-field checklist in the UI, so
-    repeating it here just duplicates the same sentence twice on screen.
-
-    Returns (label, reason) where reason is None when label is "Verified".
+    Downgrades direct Title matches to 'Uncertain' status if secondary indicators fail validation
+    checks (e.g., partial authors list mapping, explicit journal name mismatches).
     """
     reasons = []
-
     authors_check = checks.get("authors") or {}
+    
     if authors_check.get("status") == "partial":
         reasons.append("Author list only partially matches the candidate (see Authors check above).")
     elif authors_check.get("status") == "mismatch":
@@ -437,13 +411,9 @@ def _cascade_outcome(ref, checks, candidate_journal=None):
             }
             reasons.append("Journal presence mismatch (see Journal check above).")
         elif candidate_journal:
-            # Both sides present but the LLM didn't return a journal verdict
-            # (shouldn't normally happen) — neutral info, not an assertion
-            # of a match we never actually checked.
             checks["journal"] = {"status": "info", "note": candidate_journal}
     else:
-        journal_check = checks["journal"]
-        if journal_check.get("status") == "mismatch":
+        if checks["journal"].get("status") == "mismatch":
             reasons.append("Journal does not match the candidate (see Journal check above).")
 
     if reasons:
@@ -451,78 +421,33 @@ def _cascade_outcome(ref, checks, candidate_journal=None):
     return "Verified", None
 
 
-# -- Step 2: DOI check -------------------------------------------------------
-# CrossRef -> arXiv (via S2).
-#
-# Three-stage title verification per DOI hit:
-#   1. Levenshtein >= 0.8             -> Verified (fast, no LLM call)
-#   2. Levenshtein fails, LLM matches -> Verified (handles edge cases)
-#   3. Both fail                      -> set _doi_mismatch flag, return None
-#      The ref stays Pending and falls through to the title search cascade.
-#      If cascade finds the title -> Verified (wrong DOI noted in reason)
-#      If cascade finds nothing   -> Unverified
-#
-# DOI not found in any KB -> stays Pending (no flag set)
+# -- Step 2: DOI Routing Checks ----------------------------------------------
 
-def _doi_title_result(ref, retrieved_title, doi, extra_metadata=None):
-    """Three-stage title check for a resolved DOI.
-    Returns (label, source, checks, candidate) on match, or a None tuple +
-    sets _doi_mismatch flag on the ref when both Levenshtein and LLM fail.
-    source_label is inferred from the doi prefix.
-
-    extra_metadata (optional dict) may contain:
-      - container_title (str): book or journal name from CrossRef
-      - doc_type        (str): CrossRef type, e.g. "book-chapter"
-      - authors         (str): formatted author string (first 3, for the LLM)
-      - authors_list    (list): full author name list, for the comparison UI
-      - year            (str/int)
-      - publisher       (str)
-    Forwarded to the LLM so it can apply book-chapter matching rules.
-
-    candidate is a flat snapshot of the matched KB record (title, authors,
-    year, journal, doi) for side-by-side display — independent of `checks`,
-    which only records the title verdict (DOI checks are title-only).
-    """
+def _doi_title_result(ref: dict, retrieved_title: str, doi: str, extra_metadata: Optional[dict] = None) -> Tuple:
+    """Three-stage title validator verifying a resolved database entity identifier hit."""
     extra_metadata = extra_metadata or {}
-
-    # Derive a human-readable source label from the DOI
     doi_clean = doi.strip().removeprefix("https://doi.org/").lower()
-    if "10.48550/arxiv" in doi_clean or "arxiv.org" in doi_clean:
-        source_label = "arXiv_DOI"
-    else:
-        source_label = "CrossRef_DOI"
+    source_label = "arXiv_DOI" if ("10.48550/arxiv" in doi_clean or "arxiv.org" in doi_clean) else "CrossRef_DOI"
 
-    # A DOI hit confirms the title only. No note is attached here — DOI
-    # checks are shown as a bare ✓ Title with no trailing sentence in the
-    # comparison UI (unlike the title-search cascade, where notes explain
-    # what was actually compared).
-    checks = {
-        "title": {
-            "status": "match",
-            "note": None
-        }
-    }
-
+    checks = {"title": {"status": "match", "note": None}}
     candidate = {
-        "title":   retrieved_title,
-        "authors": extra_metadata.get("authors_list") or None,
-        "year":    extra_metadata.get("year"),
-        "journal": extra_metadata.get("container_title") or None,
-        "doi":     doi.strip().removeprefix("https://doi.org/"),
+        "title": retrieved_title,
+        "authors": extra_metadata.get("authors_list"),
+        "year": extra_metadata.get("year"),
+        "journal": extra_metadata.get("container_title"),
+        "doi": doi.strip().removeprefix("https://doi.org/"),
     }
 
-    # Stage 1: Levenshtein against chapter/article title
+    # Stage 1: Deterministic evaluation directly on title
     if title_matches(ref.get("title", ""), retrieved_title):
         return "Verified", source_label, checks, candidate
 
-    # Stage 1b: Levenshtein against container title (catches cases where the
-    # student cited the book title rather than the individual chapter title).
+    # Stage 1b: Deterministic evaluation directly on parent container (book/anthology level)
     container_title = extra_metadata.get("container_title", "")
     if container_title and title_matches(ref.get("title", ""), container_title):
         return "Verified", source_label, checks, candidate
 
-    # Stage 2: LLM fallback — pass full CrossRef metadata so it can apply
-    # book-chapter matching rules (query title may match container, not chapter).
+    # Stage 2: LLM Fallback contextual crosscheck
     llm_candidate = {
         "title": retrieved_title,
         "authors": [],
@@ -536,34 +461,27 @@ def _doi_title_result(ref, retrieved_title, doi, extra_metadata=None):
     if result["match"]:
         return "Verified", source_label, checks, candidate
 
-    # Stage 3: both failed — DOI resolves but title is genuinely different.
-    # Store the mismatched DOI so title search steps can annotate their result.
+    # Stage 3: Explicit Mismatch identified
     ref["verification"]["_doi_mismatch"] = doi
     return None, None, None, None
 
 
-def check_crossref(doi, ref):
+def check_crossref(doi: str, ref: dict) -> Tuple:
+    """Looks up specific digital object parameters using the CrossRef REST metadata endpoint."""
     doi_clean = doi.strip().removeprefix("https://doi.org/")
     try:
-        r = requests.get(f"https://api.crossref.org/works/{doi_clean}",
-                         params={"mailto": EMAIL}, timeout=15)
+        r = requests.get(f"https://api.crossref.org/works/{doi_clean}", params={"mailto": EMAIL}, timeout=15)
         if r.status_code == 200:
             msg = r.json()["message"]
             retrieved_title = (msg.get("title") or [""])[0]
-            full_authors = [
-                f"{a.get('given', '')} {a.get('family', '')}".strip()
-                for a in msg.get("author", [])
-            ]
-            # Extract additional metadata for LLM fallback
+            full_authors = [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in msg.get("author", [])]
+            
             extra_metadata = {
                 "container_title": (msg.get("container-title") or [""])[0],
                 "doc_type":        msg.get("type", ""),
                 "authors":         ", ".join(full_authors[:3]),
                 "authors_list":    full_authors or None,
-                "year":            (
-                                       (msg.get("published-print") or msg.get("published-online") or {})
-                                       .get("date-parts", [[None]])[0][0]
-                                   ),
+                "year":            (msg.get("published-print") or msg.get("published-online") or {}).get("date-parts", [[None]])[0][0],
                 "publisher":       msg.get("publisher", ""),
             }
             return _doi_title_result(ref, retrieved_title, doi, extra_metadata)
@@ -573,10 +491,9 @@ def check_crossref(doi, ref):
         return None, None, None, None
 
 
-def check_arxiv(doi_or_url, ref):
-    """Accepts any arXiv identifier format — DOI, abs URL, PDF URL, or bare ID."""
-    match = re.search(r'(?:10\.48550/arxiv\.|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}(?:v\d+)?)', 
-                      doi_or_url.lower())
+def check_arxiv(doi_or_url: str, ref: dict) -> Tuple:
+    """Interrogates Semantic Scholar API endpoints to locate indexed Open-Access arXiv items."""
+    match = re.search(r'(?:10\.48550/arxiv\.|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}(?:v\d+)?)', doi_or_url.lower())
     if not match:
         return None, None, None, None
     arxiv_id = match.group(1)
@@ -590,15 +507,14 @@ def check_arxiv(doi_or_url, ref):
             )
             if r.status_code == 200:
                 data = r.json()
-                retrieved_title = data.get("title", "")
                 extra_metadata = {
                     "container_title": data.get("venue") or "",
                     "authors_list":    [a.get("name") for a in data.get("authors", [])] or None,
                     "year":            data.get("year"),
                 }
-                return _doi_title_result(ref, retrieved_title, doi_or_url, extra_metadata)
+                return _doi_title_result(ref, data.get("title", ""), doi_or_url, extra_metadata)
             if r.status_code == 429:
-                backoff = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                backoff = 5 * (2 ** attempt)
                 print(f"  S2 429 on arXiv:{arxiv_id} — backing off {backoff}s (attempt {attempt + 1}/3)")
                 time.sleep(backoff)
                 continue
@@ -606,32 +522,24 @@ def check_arxiv(doi_or_url, ref):
         except Exception as e:
             print(f"  arXiv lookup error: {e}")
             return None, None, None, None
-    print(f"  arXiv check failed after 3 attempts for: {arxiv_id}")
     return None, None, None, None
 
 
-# -- Step 3: CrossRef title search ------------------------------------------
+# -- Steps 3 - 5: Multi-Knowledgebase Search Connectors -----------------------
 
-def search_crossref_title(title, rows=5):
-    params = {
-        "query.title": title,
-        "rows": rows,
-        "mailto": EMAIL,
-        "select": "title,author,published,DOI,container-title"
-    }
+def search_crossref_title(title: str, rows: int = 5) -> List[dict]:
+    """Queries CrossRef catalog registers using raw string title patterns."""
+    params = {"query.title": title, "rows": rows, "mailto": EMAIL, "select": "title,author,published,DOI,container-title"}
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+    
     for attempt in range(3):
         try:
             r = requests.get("https://api.crossref.org/works", params=params, timeout=15)
             if r.status_code == 200:
                 results = []
                 for item in r.json()["message"].get("items", []):
-                    authors = [
-                        f"{a.get('family', '')} {a.get('given', '')}".strip()
-                        for a in item.get("author", [])
-                    ]
-                    pub = item.get("published", {})
-                    year = pub.get("date-parts", [[None]])[0][0]
+                    authors = [f"{a.get('family', '')} {a.get('given', '')}".strip() for a in item.get("author", [])]
+                    year = item.get("published", {}).get("date-parts", [[None]])[0][0]
                     results.append({
                         "title":   (item.get("title") or [""])[0],
                         "authors": authors,
@@ -641,50 +549,31 @@ def search_crossref_title(title, rows=5):
                     })
                 return results
             if r.status_code in RETRYABLE_STATUS and attempt < 2:
-                wait = 2 ** attempt
-                print(f"  CrossRef {r.status_code} — retrying in {wait}s (attempt {attempt + 1}/3)...")
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
                 continue
-            print(f"  CrossRef returned {r.status_code} for: {title[:60]}")
             return []
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            wait = 2 ** attempt
-            print(f"  CrossRef {type(e).__name__} — retrying in {wait}s (attempt {attempt + 1}/3)...")
-            time.sleep(wait)
         except Exception as e:
-            print(f"  CrossRef title error: {e}")
+            print(f"  CrossRef title query error: {e}")
             return []
-    print(f"  CrossRef failed after 3 attempts for: {title[:60]}")
     return []
 
 
-# -- Step 4: OpenAlex title search ------------------------------------------
-
-OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY")  # https://openalex.org/settings/api
-
-def search_openalex(title, per_page=5):
-    params = {
-        "search": title,
-        "per-page": per_page,
-        "select": "title,authorships,publication_year,doi,primary_location"
-    }
-    if OPENALEX_API_KEY:
-        params["api_key"] = OPENALEX_API_KEY
+def search_openalex(title: str, per_page: int = 5) -> List[dict]:
+    """Queries OpenAlex service catalogs using raw string title searches."""
+    params = {"search": title, "per-page": per_page, "select": "title,authorships,publication_year,doi,primary_location"}
+    if os.getenv("OPENALEX_API_KEY"):
+        params["api_key"] = os.getenv("OPENALEX_API_KEY")
     RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
     for attempt in range(3):
         try:
-            r = requests.get("https://api.openalex.org/works", params=params,
-                             headers={"User-Agent": f"ThesisVerifier ({EMAIL})"},
-                             timeout=10)
+            r = requests.get("https://api.openalex.org/works", params=params, headers={"User-Agent": f"ThesisVerifier ({EMAIL})"}, timeout=10)
             if r.status_code == 200:
                 results = []
                 for item in r.json().get("results", []):
-                    authors = [
-                        a["author"].get("display_name", "")
-                        for a in item.get("authorships", [])
-                    ]
+                    authors = [a["author"].get("display_name", "") for a in item.get("authorships", [])]
                     primary = item.get("primary_location") or {}
-                    source  = primary.get("source") or {}
+                    source = primary.get("source") or {}
                     results.append({
                         "title":   item.get("title"),
                         "authors": authors,
@@ -694,33 +583,21 @@ def search_openalex(title, per_page=5):
                     })
                 return results
             if r.status_code in RETRYABLE_STATUS and attempt < 2:
-                if r.status_code == 429 and r.headers.get("Retry-After"):
-                    wait = float(r.headers["Retry-After"])
-                else:
-                    wait = (5 * (2 ** attempt)) + random.uniform(0, 2)  # 5-7s, 10-12s
-                print(f"  OpenAlex {r.status_code} — retrying in {wait:.1f}s (attempt {attempt + 1}/3)...")
+                wait = float(r.headers.get("Retry-After", 5)) if r.status_code == 429 else (5 * (2 ** attempt))
                 time.sleep(wait)
                 continue
-            print(f"  OpenAlex returned {r.status_code} for: {title[:60]}")
             return []
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            wait = 2 ** attempt
-            print(f"  OpenAlex {type(e).__name__} — retrying in {wait}s (attempt {attempt + 1}/3)...")
-            time.sleep(wait)
         except Exception as e:
-            print(f"  OpenAlex error: {e}")
+            print(f"  OpenAlex query error: {e}")
             return []
-    print(f"  OpenAlex failed after 3 attempts for: {title[:60]}")
     return []
 
 
-# -- Step 5: Semantic Scholar title search ----------------------------------
-
-def search_semantic_scholar(title, top_k=5):
+def search_semantic_scholar(title: str, top_k: int = 5) -> List[dict]:
+    """Queries Semantic Scholar graph indexes using raw string title lookups."""
     headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
     for attempt in range(3):
-        wait = 2 ** attempt  # 1s, 2s, 4s between attempts
-        time.sleep(wait)
+        time.sleep(2 ** attempt)
         try:
             r = requests.get(
                 "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -739,36 +616,30 @@ def search_semantic_scholar(title, top_k=5):
                     for p in r.json().get("data", [])
                 ]
             if r.status_code in (429, 500, 503):
-                backoff = 5 * (2 ** attempt)
-                print(f"  S2 {r.status_code} — backing off {backoff}s (attempt {attempt + 1}/3)")
-                time.sleep(backoff)
+                time.sleep(5 * (2 ** attempt))
                 continue
-            print(f"  S2 returned {r.status_code} for: {title[:60]}")
             return []
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            backoff = 5 * (2 ** attempt)
-            print(f"  S2 {type(e).__name__} — retrying in {backoff}s (attempt {attempt + 1}/3)...")
-            time.sleep(backoff)
-            continue
         except Exception as e:
-            print(f"  S2 error: {e}")
+            print(f"  S2 search error: {e}")
             return []
-    print(f"  S2 failed after 3 attempts for: {title[:60]}")
     return []
 
 
-def verify_references(references: list[dict], progress_callback=None) -> list[dict]:
-    """Verify a list of references through the full cascade.
+# -- Core Direct Pipeline Orchestration Execution ----------------------------
 
-    Mutates and returns the same list, adding to each reference:
-      * verification : the full notebook detail dict (label/source/reason/url/matched_candidate)
-      * status       : "Verified" | "Uncertain" | "Unverified"  (== verification label)
+def verify_references(references: List[dict], progress_callback=None) -> List[dict]:
+    """Runs a sequence of database searches to verify a list of references.
 
-    progress_callback (optional): called as progress_callback(ref, step) each
-    time a reference reaches a terminal status, where `step` names the stage
-    that resolved it. Purely observational — it never influences a decision.
+    Mutates the provided reference dictionaries dynamically in place to update 
+    their validation statuses and metadata properties.
+
+    Args:
+        references: Collection lists of unverified dictionary records.
+        progress_callback: Optional status observer callback execution hooks.
+
+    Returns:
+        The mutated original references target data collection list.
     """
-    # Fresh cost accounting per run (matches a fresh notebook execution).
     llm_usage["input_tokens"] = 0
     llm_usage["output_tokens"] = 0
     llm_usage["calls"] = 0
@@ -776,11 +647,9 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
     for ref in references:
         ref["verification"] = {"label": "Pending", "source": None, "reason": None, "matched_candidate": None}
 
-    # Observability: after each step, fire the callback for any reference that
-    # newly left "Pending". Does not touch the verification flow.
     _emitted = set()
 
-    def _emit(step):
+    def _emit(step: str):
         if progress_callback is None:
             return
         for ref in references:
@@ -788,29 +657,21 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
                 _emitted.add(id(ref))
                 progress_callback(ref, step)
 
-    # -- Step 1: Website check ----------------------------------------------
+    # -- Step 1: Website check --
     for ref in references:
         if ref.get("reference_type") == "website":
             url = ref.get("url") or ""
             if not url:
-                ref["verification"] = {
-                    "label": "Unverified", "source": "Web",
-                    "reason": "No URL found.", "url": None,
-                    "matched_candidate": None
-                }
+                ref["verification"] = {"label": "Unverified", "source": "Web", "reason": "No URL found.", "url": None, "matched_candidate": None}
             elif "doi.org" in url.lower() or url.lower().startswith("10."):
-                pass  # DOI URL — fall through to Step 2
+                pass
             else:
                 label, source, reason, candidate = check_website(url, ref_title=ref.get("title", ""))
-                ref["verification"] = {
-                    "label": label, "source": source,
-                    "reason": reason, "url": url,
-                    "matched_candidate": candidate
-                }
+                ref["verification"] = {"label": label, "source": source, "reason": reason, "url": url, "matched_candidate": candidate}
             time.sleep(0.2)
     _emit("Website check")
 
-    # -- Step 2: DOI check + arXiv URL check --------------------------------
+    # -- Step 2: DOI check + arXiv URL check --
     for ref in references:
         if ref["verification"]["label"] != "Pending":
             continue
@@ -830,30 +691,16 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
                     "label":  label,
                     "source": source,
                     "checks": checks,
-                    # DOI-resolved matches are not shown side-by-side — a DOI hit
-                    # is treated as definitive on its own, no candidate snapshot.
                     "matched_candidate": None,
                     "url":    f"https://doi.org/{doi.strip().removeprefix('https://doi.org/')}"
                 }
-
         elif "arxiv.org" in url.lower():
-            # No DOI but URL points to arXiv — look up via S2 arXiv proxy.
             label, source, checks, candidate = check_arxiv(url, ref)
             if label is not None:
-                ref["verification"] = {
-                    "label":  label,
-                    "source": source,
-                    "checks": checks,
-                    "matched_candidate": None,
-                    "url":    url
-                }
-
-        # label is None + no _doi_mismatch -> not found -> stays Pending
-        # label is None + _doi_mismatch set -> DOI found but title mismatch -> stays Pending
-        # both fall through to title search cascade
+                ref["verification"] = {"label": label, "source": source, "checks": checks, "matched_candidate": None, "url": url}
     _emit("DOI check")
 
-    # -- Step 3: CrossRef title search --------------------------------------
+    # -- Step 3: CrossRef title search --
     for ref in references:
         if ref["verification"]["label"] != "Pending":
             continue
@@ -864,9 +711,7 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
             idx = (result.get("matched_candidate") or 1) - 1
             if not (0 <= idx < len(candidates)):
                 idx = 0
-            candidate_journal = candidates[idx].get("journal") if candidates else None
-            matched_url = _get_matched_url(candidates, result.get("matched_candidate"))
-            label, reason = _cascade_outcome(ref, checks, candidate_journal)
+            label, reason = _cascade_outcome(ref, checks, candidates[idx].get("journal") if candidates else None)
             label, reason = _apply_doi_mismatch_downgrade(ref, label, reason)
             ref["verification"] = {
                 "label":  label,
@@ -874,15 +719,15 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
                 "checks": checks,
                 "reason": reason,
                 "matched_candidate": candidates[idx],
-                "url":    matched_url
+                "url":    _get_matched_url(candidates, result.get("matched_candidate"))
             }
     _emit("CrossRef title search")
 
-    # -- Step 4: OpenAlex title search --------------------------------------
+    # -- Step 4: OpenAlex title search --
     for ref in references:
         if ref["verification"]["label"] != "Pending":
             continue
-        time.sleep(1.0) 
+        time.sleep(1.0)
         candidates = search_openalex(ref.get("title", ""))
         result = llm_compare(ref, candidates)
         if result["match"]:
@@ -890,9 +735,7 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
             idx = (result.get("matched_candidate") or 1) - 1
             if not (0 <= idx < len(candidates)):
                 idx = 0
-            candidate_journal = candidates[idx].get("journal") if candidates else None
-            matched_url = _get_matched_url(candidates, result.get("matched_candidate"))
-            label, reason = _cascade_outcome(ref, checks, candidate_journal)
+            label, reason = _cascade_outcome(ref, checks, candidates[idx].get("journal") if candidates else None)
             label, reason = _apply_doi_mismatch_downgrade(ref, label, reason)
             ref["verification"] = {
                 "label":  label,
@@ -900,11 +743,11 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
                 "checks": checks,
                 "reason": reason,
                 "matched_candidate": candidates[idx],
-                "url":    matched_url
+                "url":    _get_matched_url(candidates, result.get("matched_candidate"))
             }
     _emit("OpenAlex title search")
 
-    # -- Step 5: Semantic Scholar title search ------------------------------
+    # -- Step 5: Semantic Scholar title search --
     for ref in references:
         if ref["verification"]["label"] != "Pending":
             continue
@@ -916,9 +759,7 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
             idx = (result.get("matched_candidate") or 1) - 1
             if not (0 <= idx < len(candidates)):
                 idx = 0
-            candidate_journal = candidates[idx].get("journal") if candidates else None
-            matched_url = _get_matched_url(candidates, result.get("matched_candidate"))
-            label, reason = _cascade_outcome(ref, checks, candidate_journal)
+            label, reason = _cascade_outcome(ref, checks, candidates[idx].get("journal") if candidates else None)
             label, reason = _apply_doi_mismatch_downgrade(ref, label, reason)
             ref["verification"] = {
                 "label":  label,
@@ -926,16 +767,11 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
                 "checks": checks,
                 "reason": reason,
                 "matched_candidate": candidates[idx],
-                "url":    matched_url
+                "url":    _get_matched_url(candidates, result.get("matched_candidate"))
             }
     _emit("Semantic Scholar title search")
 
-    # -- Step 6: Final resolution -------------------------------------------
-    # Resolution order for still-Pending references:
-    #   1. URL contains DOI -> Unverified (DOI failed all checks; note if the
-    #      DOI resolved but its KB title differed from the reference title)
-    #   2. Non-DOI URL present -> check_website(); Verified or Unverified (no Uncertain)
-    #   3. Nothing -> Unverified
+    # -- Step 6: Final resolution fallback boundaries --
     for ref in references:
         if ref["verification"]["label"] != "Pending":
             ref["verification"].pop("_doi_mismatch", None)
@@ -950,48 +786,25 @@ def verify_references(references: list[dict], progress_callback=None) -> list[di
         if url:
             is_doi_url = "doi.org" in url.lower() or url.lower().startswith("10.")
             if is_doi_url:
-                if doi_mismatch:
-                    unverified_reason = "DOI resolves but KB title differs from reference title; no title match found in cascade."
-                else:
-                    unverified_reason = "DOI URL did not resolve and no title match found in any knowledge base."
-                ref["verification"] = {
-                    "label":  "Unverified",
-                    "source": None,
-                    "reason": unverified_reason,
-                    "matched_candidate": None,
-                    "url":    url
-                }
+                unverified_reason = (
+                    "DOI resolves but KB title differs from reference title; no title match found in cascade."
+                    if doi_mismatch else "DOI URL did not resolve and no title match found in any knowledge base."
+                )
+                ref["verification"] = {"label": "Unverified", "source": None, "reason": unverified_reason, "matched_candidate": None, "url": url}
             else:
                 label, _, reason, candidate = check_website(url, ref_title=ref.get("title", ""))
                 if label == "Verified":
-                    ref["verification"] = {
-                        "label":  "Verified",
-                        "source": "Web_fallback",
-                        "reason": reason,
-                        "matched_candidate": candidate,
-                        "url":    url
-                    }
+                    ref["verification"] = {"label": "Verified", "source": "Web_fallback", "reason": reason, "matched_candidate": candidate, "url": url}
                 else:
-                    ref["verification"] = {
-                        "label":  "Unverified",
-                        "source": "Web_fallback",
-                        "reason": f"Not found in academic databases. URL present ({reason}).",
-                        "matched_candidate": candidate,
-                        "url":    url
-                    }
+                    ref["verification"] = {"label": "Unverified", "source": "Web_fallback", "reason": f"Not found in academic databases. URL present ({reason}).", "matched_candidate": candidate, "url": url}
             time.sleep(0.2)
             continue
 
-        ref["verification"] = {
-            "label":  "Unverified",
-            "source": None,
-            "reason": "No match found across all knowledge bases.",
-            "matched_candidate": None,
-            "url":    None
-        }
+        ref["verification"] = {"label": "Unverified", "source": None, "reason": "No match found across all knowledge bases.", "matched_candidate": None, "url": None}
+    
     _emit("Final resolution")
 
-    # Expose the requested top-level contract alongside the full detail dict.
+    # Align contract configurations
     for ref in references:
         ref["status"] = ref["verification"]["label"]
 
